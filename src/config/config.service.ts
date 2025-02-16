@@ -6,7 +6,7 @@ type Token = {
   name: string;
   symbol: string;
   type: string;
-  address: string;
+  address: `0x${string}`;
   decimals: number;
   price_feed: string;
   display_decimals: number;
@@ -25,7 +25,8 @@ export type BotChain = {
   min_order_val: number;
   max_order_val: number;
   profitability_threshold: number;
-  order_contract_address: `0x${string}`;
+  order_hub_contract_address: `0x${string}`;
+  order_spoke_contract_address: `0x${string}`;
   filler_poll_interval: number;
   tokens: Token[];
 };
@@ -41,5 +42,16 @@ export class CustomConfigService extends NestConfigService {
     return {
       ...(config as BotConfig),
     };
+  }
+
+  public getChainConfig(chain_id: bigint): BotChain {
+    const botConfig = this.botConfig;
+    const chainConfig = botConfig.chain.find(
+      (chain) => chain.chain_id === Number(chain_id),
+    );
+    if (!chainConfig) {
+      throw new Error(`Chain with id ${chain_id} not found`);
+    }
+    return chainConfig;
   }
 }

@@ -1,22 +1,28 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import {
-  Abi,
   Account,
+  Address,
   BlockTag,
   Client,
   createClient,
   GetBlockReturnType,
   GetFilterLogsReturnType,
   http,
-  HttpTransport,
   Log,
   publicActions,
   PublicActions,
   PublicRpcSchema,
+  Transport,
+  WalletActions,
+  walletActions,
+  WalletRpcSchema,
+  WatchContractEventOnLogsParameter,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { BotChain, CustomConfigService } from '../config/config.service.js';
 import { abi as orderHubAbi } from './abi/OrderHub.abi.js';
+import { abi as orderSpokeAbi } from './abi/OrderSpoke.abi.js';
+import { foundry as MockERC20Foundry } from './abi/MockERC20.foundry.js';
 
 // type OrderCreatedEvent = ExtractEventArgs<typeof orderHubAbi, 'OrderCreated'>;
 
@@ -56,24 +62,38 @@ export type OrderCreatedEvent = Log<
   typeof orderHubAbi
 >;
 
-export type OrderHubLog = Log<
+export type OrderFilledEvent = Log<
   bigint,
   number,
   false,
-  Extract<(typeof orderHubAbi)[number], { type: 'event' }>,
-  false
+  Extract<
+    (typeof orderSpokeAbi)[number],
+    { type: 'event'; name: 'OrderFilled' }
+  >,
+  false,
+  typeof orderSpokeAbi
 >;
 
+export type OrderHubLog = WatchContractEventOnLogsParameter<
+  typeof orderHubAbi
+>[number];
+
+export type OrderSpokeLog = WatchContractEventOnLogsParameter<
+  typeof orderSpokeAbi
+>[number];
+
 @Injectable()
-export class ViemService {
+export class Web3Service {
+  private logger = new Logger(Web3Service.name);
   private clients: Map<
     string,
     Client<
-      HttpTransport,
+      Transport,
       undefined,
       Account,
-      PublicRpcSchema,
-      PublicActions<HttpTransport, undefined>
+      [...PublicRpcSchema, ...WalletRpcSchema],
+      PublicActions<Transport, undefined, Account> &
+        WalletActions<undefined, Account>
     >
   >;
   private chainMap: Map<string, BotChain>;
@@ -91,7 +111,7 @@ export class ViemService {
         account: privateKeyToAccount(chain.private_key),
       });
 
-      const clientWPublic = client.extend(publicActions);
+      const clientWPublic = client.extend(publicActions).extend(walletActions);
 
       this.clients.set(chain.name, clientWPublic);
     }
@@ -112,7 +132,7 @@ export class ViemService {
     );
   }
 
-  async getBlockBatchLogs({
+  async getBlockBatchOrderHubLogs({
     chainName,
     fromBlock,
     toBlock,
@@ -121,12 +141,15 @@ export class ViemService {
     fromBlock: bigint;
     toBlock: bigint;
   }): Promise<
-    GetFilterLogsReturnType<Abi, undefined, undefined, bigint, bigint>
+    GetFilterLogsReturnType<typeof orderHubAbi | typeof orderSpokeAbi>
   > {
     const client = this.clients.get(chainName)!;
     const filter = await client.createContractEventFilter({
-      abi: orderHubAbi,
-      address: this.chainMap.get(chainName)!.order_contract_address,
+      abi: [...orderHubAbi, ...orderSpokeAbi],
+      address: [
+        this.chainMap.get(chainName)!.order_hub_contract_address,
+        this.chainMap.get(chainName)!.order_spoke_contract_address,
+      ],
       fromBlock,
       toBlock,
     });
@@ -145,7 +168,7 @@ export class ViemService {
   }): Promise<void> {
     const client = this.clients.get(chainName)!;
     client.watchContractEvent({
-      address: this.chainMap.get(chainName)!.order_contract_address,
+      address: this.chainMap.get(chainName)!.order_hub_contract_address,
       abi: orderHubAbi,
       fromBlock: fromBlock,
       onLogs: (logs) => {
@@ -157,5 +180,66 @@ export class ViemService {
         console.error(error);
       },
     });
+  }
+
+  async getAddress({ chainName }: { chainName: string }): Promise<Address> {
+    const client = this.clients.get(chainName)!;
+    const addresses = await client.getAddresses();
+    return addresses[0];
+  }
+
+  async watcOrderSpokeLogs({
+    chainName,
+    fromBlock,
+    onLog,
+  }: {
+    chainName: string;
+    fromBlock: bigint;
+    onLog: (log: OrderSpokeLog) => Promise<void>;
+  }): Promise<void> {
+    const client = this.clients.get(chainName)!;
+    client.watchContractEvent({
+      address: this.chainMap.get(chainName)!.order_spoke_contract_address,
+      abi: orderSpokeAbi,
+      fromBlock: fromBlock,
+      onLogs: (logs) => {
+        logs.forEach((log) => {
+          onLog(log).catch((error) => console.error(error));
+        });
+      },
+      onError: (error) => {
+        console.error(error);
+      },
+    });
+  }
+
+  async getBalance({
+    chainName,
+    symbol,
+  }: {
+    chainName: string;
+    symbol: string;
+  }): Promise<bigint> {
+    const client = this.clients.get(chainName)!;
+    const chainConfig = this.chainMap.get(chainName)!;
+    const address = chainConfig.tokens.find(
+      (t) => t.symbol === symbol,
+    )?.address;
+
+    if (address === undefined) {
+      throw new Error(
+        `Invalid symbol ${symbol}, token not found to get balance`,
+      );
+    }
+    const fillerAddress = (await client.getAddresses())[0];
+
+    const result = await client.readContract({
+      address,
+      abi: MockERC20Foundry.abi,
+      functionName: 'balanceOf',
+      args: [fillerAddress],
+    });
+
+    return result;
   }
 }
